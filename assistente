@@ -1,0 +1,518 @@
+#!/usr/bin/env bash
+
+# ==============================================================================
+# ASSISTENTE DE TERMINAL INTELIGENTE - Versão 2.0
+# ==============================================================================
+# Descrição: Agente de IA integrado ao terminal, capaz de executar comandos,
+#            ler arquivos, navegar no sistema e manter conversas contextualizadas.
+# Autor: gutzuh (aprimorado)
+# ==============================================================================
+
+set -euo pipefail
+
+# --- Configurações ------------------------------------------------------------
+OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
+MODELO="google/gemini-2.0-flash-001"  # Bom custo-benefício, suporta tools
+ARQUIVO_MEMORIA="$HOME/.assistente/memoria.json"
+ARQUIVO_HISTORICO="$HOME/.assistente/historico.json"
+ARQUIVO_ENV="$HOME/.assistente/.env"
+
+# Cores para output
+VERDE='\033[0;32m'
+AMARELO='\033[1;33m'
+VERMELHO='\033[0;31m'
+AZUL='\033[0;34m'
+CIANO='\033[0;36m'
+RESET='\033[0m'
+
+# --- Inicialização ------------------------------------------------------------
+mkdir -p "$HOME/.assistente"
+
+# Carregar .env se existir
+if [[ -f "$ARQUIVO_ENV" ]]; then
+    source "$ARQUIVO_ENV"
+fi
+
+if [[ -z "$OPENROUTER_API_KEY" ]]; then
+    echo -e "${VERMELHO}Erro:${RESET} A variável OPENROUTER_API_KEY não está definida."
+    echo "Defina-a no ambiente ou crie o arquivo $ARQUIVO_ENV com:"
+    echo 'OPENROUTER_API_KEY="sk-or-v1-..."'
+    exit 1
+fi
+
+# --- Funções Auxiliares -------------------------------------------------------
+
+# Exibe ajuda
+ajuda() {
+    cat << EOF
+Uso: assistente [comando|modo]
+
+Comandos:
+  ia "pergunta"      Faz uma pergunta à IA (modo único)
+  chat               Inicia modo de bate-papo interativo
+  memoria add        Adiciona informação à memória persistente
+  memoria show       Exibe a memória atual
+  memoria clear      Limpa a memória
+  historico clear    Limpa o histórico da conversa
+  help               Mostra esta ajuda
+
+Exemplos:
+  assistente ia "liste arquivos maiores que 1GB"
+  assistente chat
+  assistente memoria add "Meu projeto principal está em ~/dev/app"
+EOF
+}
+
+# Obtém contexto detalhado do sistema (função original, mantida)
+_obter_contexto_detalhado_sistema() {
+    local contexto="Informações do sistema:\n"
+    contexto+="- Sistema Operacional: $(uname -s) $(uname -r)\n"
+    contexto+="- Diretório atual: $(pwd)\n"
+    contexto+="- Usuário: $(whoami)\n"
+    contexto+="- Data/Hora: $(date)\n"
+    contexto+="- Shell: ${SHELL}\n"
+
+    # Estrutura do diretório atual (limitado a 3 níveis, máximo 50 linhas)
+    if command -v tree &> /dev/null; then
+        contexto+="\nEstrutura do diretório atual (tree -L 2):\n"
+        contexto+="$(tree -L 2 -F --dirsfirst 2>/dev/null | head -50)\n"
+    else
+        contexto+="\nConteúdo do diretório atual:\n"
+        contexto+="$(ls -la | head -30)\n"
+    fi
+
+    echo -e "$contexto"
+}
+
+# Verifica se um comando é perigoso e requer confirmação extra
+_comando_perigoso() {
+    local cmd="$1"
+    # Palavras-chave de alto risco
+    if [[ "$cmd" =~ (rm[[:space:]]+-rf|dd[[:space:]]+if=|mkfs|:(){ :|:& };:) ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Executa comando com confirmação do usuário
+_executar_comando_seguro() {
+    local comando="$1"
+    local descricao="$2"
+
+    echo -e "${AMARELO}>>> Comando sugerido:${RESET} ${CIANO}$comando${RESET}"
+    echo -e "${AMARELO}>>> Descrição:${RESET} $descricao"
+
+    if _comando_perigoso "$comando"; then
+        echo -e "${VERMELHO}!!! ALERTA: Este comando é potencialmente perigoso !!!${RESET}"
+        read -p $'\033[1;31mTem certeza ABSOLUTA que deseja executar? (digite SIM em maiúsculas): \033[0m' confirma
+        if [[ "$confirma" != "SIM" ]]; then
+            echo "Execução cancelada."
+            return 1
+        fi
+    else
+        read -p $'\033[1;33mExecutar este comando? (s/N): \033[0m' confirma
+        if [[ ! "$confirma" =~ ^[Ss]$ ]]; then
+            echo "Execução cancelada."
+            return 1
+        fi
+    fi
+
+    echo -e "${VERDE}Executando...${RESET}"
+    eval "$comando"
+    local status=$?
+    if [[ $status -eq 0 ]]; then
+        echo -e "${VERDE}Comando executado com sucesso.${RESET}"
+    else
+        echo -e "${VERMELHO}Comando falhou com código $status.${RESET}"
+    fi
+    return $status
+}
+
+# Carrega memória persistente
+_carregar_memoria() {
+    if [[ -f "$ARQUIVO_MEMORIA" ]]; then
+        cat "$ARQUIVO_MEMORIA"
+    else
+        echo "{}"
+    fi
+}
+
+# Salva memória persistente
+_salvar_memoria() {
+    echo "$1" > "$ARQUIVO_MEMORIA"
+}
+
+# Adiciona item à memória
+memoria_add() {
+    local info="$*"
+    local memoria
+    memoria=$(_carregar_memoria)
+    local novo_item="{\"timestamp\":\"$(date -Iseconds)\",\"info\":\"$info\"}"
+    local updated
+    updated=$(echo "$memoria" | jq --argjson item "$novo_item" '.items += [$item]' 2>/dev/null || echo "{\"items\":[$novo_item]}")
+    _salvar_memoria "$updated"
+    echo -e "${VERDE}Informação adicionada à memória.${RESET}"
+}
+
+# Exibe memória
+memoria_show() {
+    if [[ -f "$ARQUIVO_MEMORIA" ]]; then
+        jq '.' "$ARQUIVO_MEMORIA"
+    else
+        echo "Memória vazia."
+    fi
+}
+
+# Limpa memória
+memoria_clear() {
+    rm -f "$ARQUIVO_MEMORIA"
+    echo -e "${VERDE}Memória limpa.${RESET}"
+}
+
+# Carrega histórico da conversa (últimas N mensagens)
+_carregar_historico() {
+    if [[ -f "$ARQUIVO_HISTORICO" ]]; then
+        cat "$ARQUIVO_HISTORICO"
+    else
+        echo "[]"
+    fi
+}
+
+# Salva histórico da conversa
+_salvar_historico() {
+    echo "$1" > "$ARQUIVO_HISTORICO"
+}
+
+# Limpa histórico
+historico_clear() {
+    rm -f "$ARQUIVO_HISTORICO"
+    echo -e "${VERDE}Histórico limpo.${RESET}"
+}
+
+# --- Ferramentas para Function Calling ---------------------------------------
+
+# Ferramenta: ler arquivo
+ferramenta_ler_arquivo() {
+    local caminho="$1"
+    if [[ -f "$caminho" ]]; then
+        head -c 50000 "$caminho"  # Limita a 50KB para não estourar contexto
+    else
+        echo "Erro: Arquivo não encontrado: $caminho"
+    fi
+}
+
+# Ferramenta: listar diretório
+ferramenta_listar_diretorio() {
+    local caminho="${1:-.}"
+    if [[ -d "$caminho" ]]; then
+        ls -la "$caminho" | head -50
+    else
+        echo "Erro: Diretório não encontrado: $caminho"
+    fi
+}
+
+# --- Integração com OpenRouter (com streaming e tools) -----------------------
+
+# Função principal que chama a API com histórico e ferramentas
+_chamar_api() {
+    local mensagem_usuario="$1"
+    local historico
+    historico=$(_carregar_historico)
+    local memoria
+    memoria=$(_carregar_memoria)
+    local contexto_sistema
+    contexto_sistema=$(_obter_contexto_detalhado_sistema)
+
+    # Construir o prompt do sistema
+    local system_prompt="Você é um assistente de terminal Linux inteligente, amigável e preciso.
+Você está rodando diretamente no terminal do usuário.
+Contexto do sistema:
+$contexto_sistema
+
+Memória persistente do usuário:
+$memoria
+
+Você pode sugerir comandos para o usuário executar. Quando sugerir um comando, formate-o como:
+\`\`\`bash
+comando aqui
+\`\`\`
+e forneça uma breve explicação do que ele faz.
+Você também tem acesso a ferramentas para ler arquivos ou listar diretórios. Use-as quando necessário para entender melhor o ambiente antes de responder."
+
+    # Preparar mensagens para a API
+    local mensagens_json
+    mensagens_json=$(jq -n \
+        --arg system "$system_prompt" \
+        --arg user "$mensagem_usuario" \
+        --argjson historico "$historico" \
+        '{
+            messages: (
+                [{ role: "system", content: $system }] +
+                $historico +
+                [{ role: "user", content: $user }]
+            )
+        }')
+
+    # Definição das ferramentas (tools)
+    local tools_json='[
+        {
+            "type": "function",
+            "function": {
+                "name": "ler_arquivo",
+                "description": "Lê o conteúdo de um arquivo do sistema",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "caminho": {
+                            "type": "string",
+                            "description": "Caminho completo do arquivo a ser lido"
+                        }
+                    },
+                    "required": ["caminho"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "listar_diretorio",
+                "description": "Lista o conteúdo de um diretório",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "caminho": {
+                            "type": "string",
+                            "description": "Caminho do diretório (padrão: diretório atual)"
+                        }
+                    }
+                }
+            }
+        }
+    ]'
+
+    # Construir payload
+    local payload
+    payload=$(jq -n \
+        --arg model "$MODELO" \
+        --argjson messages "$mensagens_json" \
+        --argjson tools "$tools_json" \
+        --arg stream "true" \
+        '{
+            model: $model,
+            messages: $messages.messages,
+            tools: $tools,
+            tool_choice: "auto",
+            stream: ($stream == "true"),
+            max_tokens: 2048
+        }')
+
+    # Chamada curl com streaming
+    local response=""
+    local tool_calls="[]"
+    local finish_reason=""
+
+    # Enviar requisição e processar resposta em streaming
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^data:\ (.*)$ ]]; then
+            local data="${BASH_REMATCH[1]}"
+            if [[ "$data" == "[DONE]" ]]; then
+                break
+            fi
+
+            # Extrair conteúdo do delta
+            local content
+            content=$(echo "$data" | jq -r '.choices[0].delta.content // empty' 2>/dev/null)
+            if [[ -n "$content" ]]; then
+                printf "%s" "$content"
+                response+="$content"
+            fi
+
+            # Verificar tool calls no delta
+            local tool_delta
+            tool_delta=$(echo "$data" | jq -c '.choices[0].delta.tool_calls // empty' 2>/dev/null)
+            if [[ -n "$tool_delta" ]]; then
+                # Acumular tool calls (pode vir em múltiplos deltas)
+                tool_calls=$(echo "$tool_calls" | jq --argjson delta "$tool_delta" '. + $delta' 2>/dev/null || echo "$tool_delta")
+            fi
+
+            # Verificar finish_reason
+            local fr
+            fr=$(echo "$data" | jq -r '.choices[0].finish_reason // empty' 2>/dev/null)
+            if [[ -n "$fr" ]]; then
+                finish_reason="$fr"
+            fi
+        fi
+    done < <(curl -s -N -X POST "https://openrouter.ai/api/v1/chat/completions" \
+        -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+        -H "Content-Type: application/json" \
+        -H "HTTP-Referer: http://localhost" \
+        -H "X-Title: Assistente Terminal" \
+        -d "$payload")
+
+    echo ""  # Nova linha após streaming
+
+    # Processar tool calls se houver
+    if [[ "$finish_reason" == "tool_calls" || $(echo "$tool_calls" | jq 'length') -gt 0 ]]; then
+        echo -e "${AZUL}[Usando ferramentas...]${RESET}"
+        local tool_results=""
+        local tool_call_count=$(echo "$tool_calls" | jq 'length')
+        for i in $(seq 0 $((tool_call_count - 1))); do
+            local func_name=$(echo "$tool_calls" | jq -r ".[$i].function.name")
+            local func_args=$(echo "$tool_calls" | jq -r ".[$i].function.arguments")
+            local resultado=""
+            case "$func_name" in
+                "ler_arquivo")
+                    local caminho=$(echo "$func_args" | jq -r '.caminho')
+                    resultado=$(ferramenta_ler_arquivo "$caminho")
+                    ;;
+                "listar_diretorio")
+                    local caminho=$(echo "$func_args" | jq -r '.caminho // "."')
+                    resultado=$(ferramenta_listar_diretorio "$caminho")
+                    ;;
+                *)
+                    resultado="Erro: Ferramenta desconhecida: $func_name"
+                    ;;
+            esac
+            tool_results+="Ferramenta: $func_name\nArgumentos: $func_args\nResultado:\n$resultado\n\n"
+        done
+
+        # Enviar novamente para API com os resultados das ferramentas
+        local nova_mensagem="Resultados das ferramentas:\n$tool_results\nCom base nisso, responda à pergunta original do usuário: \"$mensagem_usuario\""
+        # Recursão simples (evitar loops infinitos com contador)
+        # Apenas chamamos novamente sem ferramentas para obter resposta final
+        local final_payload
+        final_payload=$(jq -n \
+            --arg model "$MODELO" \
+            --arg system "$system_prompt" \
+            --arg user_msg "$mensagem_usuario" \
+            --arg tool_results "$tool_results" \
+            '{
+                model: $model,
+                messages: [
+                    { role: "system", content: $system },
+                    { role: "user", content: $user_msg },
+                    { role: "assistant", content: null, tool_calls: $tool_results },  # Simplificação
+                    { role: "tool", content: $tool_results }
+                ],
+                stream: false
+            }' | jq '.messages[2].tool_calls = []')  # Correção do payload (não precisa de tool_calls complexo)
+
+        # Chamada não-streaming para a resposta final
+        local final_response
+        final_response=$(curl -s -X POST "https://openrouter.ai/api/v1/chat/completions" \
+            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -H "HTTP-Referer: http://localhost" \
+            -H "X-Title: Assistente Terminal" \
+            -d "$final_payload" | jq -r '.choices[0].message.content')
+        echo "$final_response"
+        response="$final_response"
+    fi
+
+    # Extrair comando sugerido (se houver) e oferecer execução
+    if [[ "$response" =~ \`\`\`bash[[:space:]]*([^\`]+)\`\`\` ]]; then
+        local comando_sugerido="${BASH_REMATCH[1]}"
+        comando_sugerido=$(echo "$comando_sugerido" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [[ -n "$comando_sugerido" ]]; then
+            echo ""
+            _executar_comando_seguro "$comando_sugerido" "Comando sugerido pela IA"
+        fi
+    fi
+
+    # Atualizar histórico
+    local novo_historico
+    novo_historico=$(echo "$historico" | jq \
+        --arg user "$mensagem_usuario" \
+        --arg assistant "$response" \
+        '. + [{"role":"user","content":$user}, {"role":"assistant","content":$assistant}] | .[-20:]')  # manter últimos 20
+    _salvar_historico "$novo_historico"
+}
+
+# --- Modo Interativo (Chat) ---------------------------------------------------
+modo_chat() {
+    echo -e "${CIANO}=== Assistente Terminal Interativo ===${RESET}"
+    echo "Digite 'sair' ou pressione Ctrl+C para encerrar."
+    echo "Comandos especiais: /memoria add ..., /historico clear, /help"
+    echo ""
+
+    while true; do
+        read -p $'\033[0;32mVocê: \033[0m' input
+        if [[ "$input" == "sair" || "$input" == "exit" ]]; then
+            echo -e "${AMARELO}Até logo!${RESET}"
+            break
+        elif [[ "$input" == "/historico clear" ]]; then
+            historico_clear
+            continue
+        elif [[ "$input" =~ ^/memoria\ (.*)$ ]]; then
+            eval "memoria_${BASH_REMATCH[1]}"
+            continue
+        elif [[ "$input" == "/help" ]]; then
+            ajuda
+            continue
+        elif [[ -z "$input" ]]; then
+            continue
+        fi
+
+        echo -ne "${AZUL}Assistente: ${RESET}"
+        _chamar_api "$input"
+        echo ""
+    done
+}
+
+# --- Modo Único (ia) ----------------------------------------------------------
+modo_ia() {
+    local pergunta="$*"
+    echo -ne "${AZUL}Assistente: ${RESET}"
+    _chamar_api "$pergunta"
+}
+
+# --- Execução Principal -------------------------------------------------------
+case "${1:-}" in
+    ia)
+        shift
+        if [[ $# -eq 0 ]]; then
+            echo "Uso: assistente ia \"sua pergunta\""
+            exit 1
+        fi
+        modo_ia "$@"
+        ;;
+    chat)
+        modo_chat
+        ;;
+    memoria)
+        shift
+        case "${1:-}" in
+            add)
+                shift
+                memoria_add "$@"
+                ;;
+            show)
+                memoria_show
+                ;;
+            clear)
+                memoria_clear
+                ;;
+            *)
+                echo "Subcomando de memória inválido. Use: add, show, clear"
+                ;;
+        esac
+        ;;
+    historico)
+        shift
+        case "${1:-}" in
+            clear)
+                historico_clear
+                ;;
+            *)
+                echo "Subcomando de histórico inválido. Use: clear"
+                ;;
+        esac
+        ;;
+    help|--help|-h)
+        ajuda
+        ;;
+    *)
+        echo "Comando não reconhecido. Use 'assistente help' para ajuda."
+        exit 1
+        ;;
+esac
